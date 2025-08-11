@@ -1,4 +1,4 @@
-import React { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import { Upload, Settings, TrendingUp, Package, AlertTriangle, Download } from 'lucide-react';
 
