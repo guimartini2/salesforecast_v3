@@ -1,820 +1,315 @@
-const AmazonPOPredictor = () => {
-  // State management
-  const [csvData, setCsvData] = useState(null);
-  const [asinData, setAsinData] = useState([]);
-  const [selectedAsin, setSelectedAsin] = useState('');
-  
-  // Model parameters
-  const [forecastModel, setForecastModel] = useState('moving_average');
-  const [movingAvgPeriods, setMovingAvgPeriods] = useState(4);
-  const [exponentialAlpha, setExponentialAlpha] = useState(0.3);
-  const [trendAlpha, setTrendAlpha] = useState(0.2);
-  const [seasonalityPeriod, setSeasonalityPeriod] = useState(12);
-  
-  // Business parameters
-  const [currentInventory, setCurrentInventory] = useState(1000);
-  const [asinPrice, setAsinPrice] = useState(25.99);
-  const [targetWoh, setTargetWoh] = useState(4);
-  const [leadTimeWeeks, setLeadTimeWeeks] = useState(3);
-  const [forecastHorizon, setForecastHorizon] = useState(26);
-  const [safetyStockWeeks, setSafetyStockWeeks] = useState(1);
-  const [minOrderQuantity, setMinOrderQuantity] = useState(500);
-  const [maxOrderQuantity, setMaxOrderQuantity] = useState(10000);
-  
-  // Results
-  const [predictions, setPredictions] = useState([]);
-  const [poRecommendations, setPoRecommendations] = useState([]);
+# streamlit_app.py
+import io
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-  // Parse CSV data
-  const parseCSVData = (csvText) => {
-    const lines = csvText.split('\n');
-    const headers = lines[1]?.split(';') || [];
-    
-    if (headers.length < 4) return [];
-    
-    const weekColumns = headers.slice(3).filter(col => col.startsWith('Week'));
-    const dataLine = lines[2]?.split(';') || [];
-    
-    if (dataLine.length < 4) return [];
-    
-    const asin = dataLine[0];
-    const productTitle = dataLine[1];
-    const brand = dataLine[2];
-    
-    const weeklyData = weekColumns.map((weekHeader, index) => {
-      const value = parseFloat(dataLine[3 + index]?.replace(',', '')) || 0;
-      const weekMatch = weekHeader.match(/Week (\d+)/);
-      const weekNumber = weekMatch ? parseInt(weekMatch[1]) : index;
-      return { week: weekNumber, forecast: value, weekHeader };
-    });
-    
-    return [{
-      asin,
-      productTitle,
-      brand,
-      weeklyData: weeklyData.filter(w => w.forecast > 0)
-    }];
-  };
+st.set_page_config(page_title="Amazon PO Replenishment Predictor", layout="wide")
 
-  // Forecasting models
-  const applyForecastModel = (historicalData, horizon) => {
-    if (!historicalData || historicalData.length === 0) return [];
-    
-    const forecasts = [];
-    const values = historicalData.map(d => d.forecast);
-    
-    switch (forecastModel) {
-      case 'moving_average':
-        for (let i = 0; i < horizon; i++) {
-          const recentValues = values.slice(-movingAvgPeriods);
-          const avg = recentValues.reduce((a, b) => a + b, 0) / recentValues.length;
-          forecasts.push(avg);
-          values.push(avg);
-        }
-        break;
-        
-      case 'exponential_smoothing':
-        let lastForecast = values[values.length - 1];
-        for (let i = 0; i < horizon; i++) {
-          forecasts.push(lastForecast);
-        }
-        break;
-        
-      case 'linear_trend':
-        const n = values.length;
-        const sumX = (n * (n + 1)) / 2;
-        const sumXX = (n * (n + 1) * (2 * n + 1)) / 6;
-        const sumY = values.reduce((a, b) => a + b, 0);
-        const sumXY = values.reduce((sum, val, idx) => sum + val * (idx + 1), 0);
-        
-        const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
-        const intercept = (sumY - slope * sumX) / n;
-        
-        for (let i = 0; i < horizon; i++) {
-          const forecast = intercept + slope * (n + i + 1);
-          forecasts.push(Math.max(0, forecast));
-        }
-        break;
-        
-      case 'seasonal_naive':
-        const seasonLength = Math.min(seasonalityPeriod, values.length);
-        for (let i = 0; i < horizon; i++) {
-          const seasonalIndex = i % seasonLength;
-          const seasonalValue = values[values.length - seasonLength + seasonalIndex] || values[values.length - 1];
-          forecasts.push(seasonalValue);
-        }
-        break;
-        
-      default:
-        const avgValue = values.reduce((a, b) => a + b, 0) / values.length;
-        for (let i = 0; i < horizon; i++) {
-          forecasts.push(avgValue);
-        }
-    }
-    
-    return forecasts;
-  };
+# -----------------------------
+# Utilities
+# -----------------------------
+def detect_delimiter(header_line: str) -> str:
+    return ";" if header_line.count(";") > header_line.count(",") else ","
 
-  // Calculate PO requirements
-  const calculatePORequirements = (historicalData, forecastedValues) => {
-    if (!forecastedValues || forecastedValues.length === 0) return [];
-    
-    const poData = [];
-    let currentInv = currentInventory;
-    
-    for (let week = 0; week < forecastedValues.length; week++) {
-      const weeklyDemand = forecastedValues[week];
-      const projectedInventory = currentInv - weeklyDemand;
-      
-      // Calculate target inventory (WOH * average weekly demand)
-      const avgWeeklyDemand = forecastedValues.slice(Math.max(0, week - 3), week + 1)
-        .reduce((a, b) => a + b, 0) / Math.min(4, week + 1);
-      
-      const targetInventory = targetWoh * avgWeeklyDemand;
-      const safetyStock = safetyStockWeeks * avgWeeklyDemand;
-      const reorderPoint = (leadTimeWeeks * avgWeeklyDemand) + safetyStock;
-      
-      let poQuantity = 0;
-      let poValue = 0;
-      let orderTrigger = false;
-      
-      // Check if we need to place an order
-      if (projectedInventory <= reorderPoint) {
-        orderTrigger = true;
-        poQuantity = Math.max(
-          minOrderQuantity,
-          Math.min(maxOrderQuantity, targetInventory - projectedInventory + (leadTimeWeeks * avgWeeklyDemand))
-        );
-        poValue = poQuantity * asinPrice;
-        currentInv += poQuantity;
-      }
-      
-      currentInv = Math.max(0, projectedInventory);
-      
-      poData.push({
-        week: week + 1,
-        demand: Math.round(weeklyDemand),
-        inventory: Math.round(currentInv),
-        targetInventory: Math.round(targetInventory),
-        reorderPoint: Math.round(reorderPoint),
-        poQuantity: Math.round(poQuantity),
-        poValue: Math.round(poValue),
-        orderTrigger,
-        woh: currentInv / avgWeeklyDemand
-      });
-    }
-    
-    return poData;
-  };
+def parse_csv(content: bytes) -> pd.DataFrame:
+    text = content.decode("utf-8", errors="ignore")
+    lines = [ln for ln in re.split(r"\r?\n", text) if ln.strip()]
+    if len(lines) < 2:
+        return pd.DataFrame()
 
-  // Process data when parameters change
-  useEffect(() => {
-    if (asinData.length > 0 && selectedAsin) {
-      const asin = asinData.find(a => a.asin === selectedAsin);
-      if (asin && asin.weeklyData) {
-        const forecasts = applyForecastModel(asin.weeklyData, forecastHorizon);
-        const poData = calculatePORequirements(asin.weeklyData, forecasts);
-        
-        setPredictions(forecasts.map((f, i) => ({
-          week: i + 1,
-          forecast: Math.round(f),
-          type: 'forecast'
-        })));
-        
-        setPoRecommendations(poData);
-      }
-    }
-  }, [asinData, selectedAsin, forecastModel, movingAvgPeriods, exponentialAlpha, 
-      currentInventory, targetWoh, leadTimeWeeks, forecastHorizon, safetyStockWeeks,
-      minOrderQuantity, maxOrderQuantity, asinPrice, trendAlpha, seasonalityPeriod]);
+    delim = detect_delimiter(lines[0])
+    # Heuristic: second line is the header row with Week columns per your JS
+    headers = [h.strip() for h in lines[1].split(delim)]
+    # mandatory first 3 columns
+    if len(headers) < 4:
+        return pd.DataFrame()
 
-  // File upload handler
-  const handleFileUpload = async (event) => {
-    const file = event.target.files[0];
-    if (file) {
-      try {
-        const text = await file.text();
-        const parsed = parseCSVData(text);
-        setCsvData(text);
-        setAsinData(parsed);
-        if (parsed.length > 0) {
-          setSelectedAsin(parsed[0].asin);
-        }
-      } catch (error) {
-        console.error('Error parsing CSV:', error);
-      }
-    }
-  };
+    # identify weekly columns
+    week_cols = [h for h in headers[3:] if re.match(r"Week\s*\d+$", h, re.I)]
+    if not week_cols:
+        return pd.DataFrame()
 
-  // Calculate summary metrics
-  const summaryMetrics = useMemo(() => {
-    if (poRecommendations.length === 0) return {};
-    
-    const totalPOValue = poRecommendations.reduce((sum, po) => sum + po.poValue, 0);
-    const totalPOQuantity = poRecommendations.reduce((sum, po) => sum + po.poQuantity, 0);
-    const avgWOH = poRecommendations.reduce((sum, po) => sum + (po.woh || 0), 0) / poRecommendations.length;
-    const stockoutRisk = poRecommendations.filter(po => po.inventory <= 0).length;
-    
-    return {
-      totalPOValue: Math.round(totalPOValue),
-      totalPOQuantity: Math.round(totalPOQuantity),
-      avgWOH: Math.round(avgWOH * 10) / 10,
-      stockoutRisk
-    };
-  }, [poRecommendations]);
+    # Build dataframe from line 2 onward as data
+    data_rows = []
+    for row in lines[2:]:
+        if not row.strip():
+            continue
+        cols = [c.strip() for c in row.split(delim)]
+        if len(cols) < 4:
+            continue
+        asin, title, brand = cols[0:3]
+        # numeric clean (remove thousands commas)
+        vals = []
+        for c in cols[3:3+len(week_cols)]:
+            c = (c or "").replace(",", "")
+            try:
+                vals.append(float(c))
+            except ValueError:
+                vals.append(0.0)
+        entry = {"ASIN": asin, "Product Title": title, "Brand": brand}
+        for w_name, v in zip(week_cols, vals):
+            entry[w_name] = v
+        data_rows.append(entry)
 
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-6">
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="text-center mb-8">
-          <h1 className="text-4xl font-bold text-gray-800 mb-4">
-            Amazon PO Replenishment Predictor
-          </h1>
-          <p className="text-lg text-gray-600 max-w-3xl mx-auto">
-            Advanced forecasting and inventory optimization for Amazon FBA replenishment planning
-          </p>
-        </div>
+    df = pd.DataFrame(data_rows)
+    # Ensure all week columns exist even if some rows were short
+    for w in week_cols:
+        if w not in df.columns:
+            df[w] = 0.0
+    # Keep column order: id cols + weeks
+    return df[["ASIN", "Product Title", "Brand"] + week_cols]
 
-        {/* File Upload */}
-        <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
-          <div className="flex items-center mb-4">
-            <Upload className="text-blue-600 mr-3" size={24} />
-            <h2 className="text-xl font-semibold text-gray-800">Upload Forecast Data</h2>
-          </div>
-          <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
-            <input
-              type="file"
-              accept=".csv"
-              onChange={handleFileUpload}
-              className="hidden"
-              id="csvUpload"
-            />
-            <label
-              htmlFor="csvUpload"
-              className="cursor-pointer flex flex-col items-center"
-            >
-              <Upload className="text-gray-400 mb-4" size={48} />
-              <span className="text-lg font-medium text-gray-600 mb-2">
-                Upload your CSV forecast file
-              </span>
-              <span className="text-sm text-gray-500">
-                CSV files with ASIN, Product Title, Brand, and weekly forecasts
-              </span>
-            </label>
-          </div>
-          {asinData.length > 0 && (
-            <div className="mt-4 p-4 bg-green-50 rounded-lg">
-              <p className="text-green-800">
-                ✅ Successfully loaded {asinData.length} ASIN(s)
-              </p>
-            </div>
-          )}
-        </div>
+def moving_average(values, horizon, periods=4):
+    vals = list(values)
+    out = []
+    for _ in range(horizon):
+        span = min(periods, len(vals)) or 1
+        avg = float(np.mean(vals[-span:])) if vals else 0.0
+        out.append(avg)
+        vals.append(avg)
+    return out
 
-        {/* Configuration Panel */}
-        {asinData.length > 0 && (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-            {/* ASIN Selection & Business Parameters */}
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center mb-4">
-                <Package className="text-green-600 mr-3" size={24} />
-                <h3 className="text-lg font-semibold text-gray-800">Product & Inventory</h3>
-              </div>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Select ASIN
-                  </label>
-                  <select
-                    value={selectedAsin}
-                    onChange={(e) => setSelectedAsin(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    {asinData.map(asin => (
-                      <option key={asin.asin} value={asin.asin}>
-                        {asin.asin} - {asin.brand}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+def exponential_smoothing(values, horizon, alpha=0.3):
+    if not len(values):
+        return [0.0]*horizon
+    level = values[0]
+    for t in range(1, len(values)):
+        level = alpha*values[t] + (1-alpha)*level
+    return [level]*horizon
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Current Inventory
-                  </label>
-                  <input
-                    type="number"
-                    value={currentInventory}
-                    onChange={(e) => setCurrentInventory(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
+def linear_trend(values, horizon):
+    n = len(values)
+    if n == 0:
+        return [0.0]*horizon
+    x = np.arange(1, n+1, dtype=float)
+    y = np.array(values, dtype=float)
+    # least squares
+    A = np.vstack([x, np.ones_like(x)]).T
+    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+    forecasts = []
+    for i in range(1, horizon+1):
+        f = intercept + slope*(n + i)
+        forecasts.append(max(0.0, f))
+    return forecasts
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    ASIN Price ($)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={asinPrice}
-                    onChange={(e) => setAsinPrice(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
+def seasonal_naive(values, horizon, season=12):
+    if not len(values):
+        return [0.0]*horizon
+    s = min(season, len(values))
+    hist = values[-s:]
+    out = []
+    for i in range(horizon):
+        out.append(hist[i % s])
+    return out
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Target WOH (Weeks on Hand)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.5"
-                    value={targetWoh}
-                    onChange={(e) => setTargetWoh(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
+def compute_po_schedule(
+    hist_values,                      # list of floats (weekly demand history) – not used directly here
+    forecasts,                        # list of floats (weekly forecast)
+    current_inventory: float,
+    target_woh: float,
+    lead_time_weeks: int,
+    safety_stock_weeks: float,
+    min_order_qty: int,
+    max_order_qty: int,
+    price: float,
+    avg_window: int = 4
+):
+    """
+    Lead-time aware: orders placed today arrive after `lead_time_weeks`.
+    We model a pipeline list of length lead_time_weeks; each week we receive pipeline.pop(0).
+    """
+    weeks = len(forecasts)
+    pipeline = [0]*max(0, lead_time_weeks)  # arrivals by week
+    on_hand = float(current_inventory)
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Lead Time (Weeks)
-                  </label>
-                  <input
-                    type="number"
-                    value={leadTimeWeeks}
-                    onChange={(e) => setLeadTimeWeeks(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-            </div>
+    rows = []
+    for w in range(weeks):
+        # Receive arrivals (if any)
+        if lead_time_weeks > 0:
+            arriving = pipeline.pop(0) if pipeline else 0
+            on_hand += arriving
+        else:
+            arriving = 0
 
-            {/* Forecast Model Parameters */}
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center mb-4">
-                <TrendingUp className="text-purple-600 mr-3" size={24} />
-                <h3 className="text-lg font-semibold text-gray-800">Forecast Model</h3>
-              </div>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Forecasting Method
-                  </label>
-                  <select
-                    value={forecastModel}
-                    onChange={(e) => setForecastModel(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    <option value="moving_average">Moving Average</option>
-                    <option value="exponential_smoothing">Exponential Smoothing</option>
-                    <option value="linear_trend">Linear Trend</option>
-                    <option value="seasonal_naive">Seasonal Naive</option>
-                  </select>
-                </div>
+        # This week's demand (forecast)
+        demand = float(forecasts[w])
 
-                {forecastModel === 'moving_average' && (
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Moving Average Periods
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="12"
-                      value={movingAvgPeriods}
-                      onChange={(e) => setMovingAvgPeriods(Number(e.target.value))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-                )}
+        # Average weekly demand over a short window including this week’s forecast
+        start = max(0, w - (avg_window - 1))
+        window_vals = forecasts[start:w+1]
+        avg_demand = float(np.mean(window_vals)) if len(window_vals) else (demand or 1.0)
 
-                {forecastModel === 'exponential_smoothing' && (
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Alpha (0.1-0.9)
-                    </label>
-                    <input
-                      type="number"
-                      min="0.1"
-                      max="0.9"
-                      step="0.1"
-                      value={exponentialAlpha}
-                      onChange={(e) => setExponentialAlpha(Number(e.target.value))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-                )}
+        target_inventory = target_woh * avg_demand
+        safety_stock = safety_stock_weeks * avg_demand
+        reorder_point = lead_time_weeks * avg_demand + safety_stock
 
-                {forecastModel === 'seasonal_naive' && (
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Seasonality Period
-                    </label>
-                    <input
-                      type="number"
-                      min="4"
-                      max="52"
-                      value={seasonalityPeriod}
-                      onChange={(e) => setSeasonalityPeriod(Number(e.target.value))}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-                )}
+        # Inventory position BEFORE placing a new order but after arrivals, before demand
+        inv_position_before_demand = on_hand
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Forecast Horizon (Weeks)
-                  </label>
-                  <input
-                    type="number"
-                    min="4"
-                    max="52"
-                    value={forecastHorizon}
-                    onChange={(e) => setForecastHorizon(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-            </div>
+        # Consume demand
+        on_hand_after_demand = on_hand - demand
 
-            {/* Advanced Parameters */}
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center mb-4">
-                <Settings className="text-orange-600 mr-3" size={24} />
-                <h3 className="text-lg font-semibold text-gray-800">Advanced Settings</h3>
-              </div>
-              
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Safety Stock (Weeks)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.5"
-                    value={safetyStockWeeks}
-                    onChange={(e) => setSafetyStockWeeks(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
+        # Check reorder after consuming demand (conservative)
+        order_trigger = on_hand_after_demand <= reorder_point
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Min Order Quantity
-                  </label>
-                  <input
-                    type="number"
-                    value={minOrderQuantity}
-                    onChange={(e) => setMinOrderQuantity(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
+        po_qty = 0
+        if order_trigger:
+            raw_needed = target_inventory - on_hand_after_demand + lead_time_weeks*avg_demand
+            po_qty = int(np.clip(np.ceil(raw_needed), min_order_qty, max_order_qty))
+            if lead_time_weeks > 0:
+                # schedule arrival
+                if len(pipeline) < lead_time_weeks:
+                    # pad if needed (shouldn't happen, but safe)
+                    pipeline += [0]*(lead_time_weeks - len(pipeline))
+                pipeline[-1] += po_qty  # lands after lead time
+            else:
+                # arrives immediately
+                on_hand_after_demand += po_qty
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Max Order Quantity
-                  </label>
-                  <input
-                    type="number"
-                    value={maxOrderQuantity}
-                    onChange={(e) => setMaxOrderQuantity(Number(e.target.value))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
+        on_hand = max(0.0, on_hand_after_demand)
+        woh = (on_hand / avg_demand) if avg_demand > 1e-9 else 0.0
 
-        {/* Summary Metrics */}
-        {poRecommendations.length > 0 && (
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-            <div className="bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-blue-100 text-sm font-medium">Total PO Value</p>
-                  <p className="text-2xl font-bold">${summaryMetrics.totalPOValue?.toLocaleString()}</p>
-                </div>
-                <Package className="text-blue-200" size={32} />
-              </div>
-            </div>
+        rows.append({
+            "Week": w+1,
+            "Demand": round(demand),
+            "Arrivals": arriving,
+            "Inventory": int(round(on_hand)),
+            "WOH": round(woh, 1),
+            "TargetInventory": int(round(target_inventory)),
+            "ReorderPoint": int(round(reorder_point)),
+            "POQty": int(po_qty),
+            "POValue": int(round(po_qty * price)),
+            "Status": "Order Required" if order_trigger else ("Low Stock" if on_hand <= reorder_point else "Normal"),
+        })
 
-            <div className="bg-gradient-to-r from-green-500 to-green-600 text-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-green-100 text-sm font-medium">Total PO Quantity</p>
-                  <p className="text-2xl font-bold">{summaryMetrics.totalPOQuantity?.toLocaleString()}</p>
-                </div>
-                <TrendingUp className="text-green-200" size={32} />
-              </div>
-            </div>
+    return pd.DataFrame(rows)
 
-            <div className="bg-gradient-to-r from-purple-500 to-purple-600 text-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-purple-100 text-sm font-medium">Avg WOH</p>
-                  <p className="text-2xl font-bold">{summaryMetrics.avgWOH}</p>
-                </div>
-                <Settings className="text-purple-200" size={32} />
-              </div>
-            </div>
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Amazon PO Replenishment Predictor (Python)")
 
-            <div className="bg-gradient-to-r from-red-500 to-red-600 text-white rounded-lg shadow-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-red-100 text-sm font-medium">Stockout Risk</p>
-                  <p className="text-2xl font-bold">{summaryMetrics.stockoutRisk} weeks</p>
-                </div>
-                <AlertTriangle className="text-red-200" size={32} />
-              </div>
-            </div>
-          </div>
-        )}
+st.markdown(
+    "Upload a CSV with columns: **ASIN**, **Product Title**, **Brand**, then **Week 1, Week 2, ...**"
+)
 
-        {/* Charts */}
-        {poRecommendations.length > 0 && (
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 mb-8">
-            {/* Demand Forecast Chart */}
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <h3 className="text-xl font-semibold text-gray-800 mb-4">
-                Demand Forecast & Inventory Levels
-              </h3>
-              <ResponsiveContainer width="100%" height={400}>
-                <LineChart data={poRecommendations}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="week" />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  <Line 
-                    type="monotone" 
-                    dataKey="demand" 
-                    stroke="#3B82F6" 
-                    strokeWidth={3}
-                    name="Weekly Demand"
-                  />
-                  <Line 
-                    type="monotone" 
-                    dataKey="inventory" 
-                    stroke="#10B981" 
-                    strokeWidth={2}
-                    name="Inventory Level"
-                  />
-                  <Line 
-                    type="monotone" 
-                    dataKey="reorderPoint" 
-                    stroke="#F59E0B" 
-                    strokeDasharray="5 5"
-                    name="Reorder Point"
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
+if not uploaded:
+    st.info("Awaiting CSV upload…")
+    st.stop()
 
-            {/* PO Quantities Chart */}
-            <div className="bg-white rounded-lg shadow-lg p-6">
-              <h3 className="text-xl font-semibold text-gray-800 mb-4">
-                Purchase Order Quantities
-              </h3>
-              <ResponsiveContainer width="100%" height={400}>
-                <BarChart data={poRecommendations.filter(po => po.poQuantity > 0)}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="week" />
-                  <YAxis />
-                  <Tooltip />
-                  <Legend />
-                  <Bar 
-                    dataKey="poQuantity" 
-                    fill="#8B5CF6" 
-                    name="PO Quantity"
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        )}
+df = parse_csv(uploaded.read())
+if df.empty:
+    st.error("Could not parse the CSV. Make sure it includes ASIN / Product Title / Brand and Week N columns.")
+    st.stop()
 
-        {/* PO Schedule Table */}
-        {poRecommendations.length > 0 && (
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-xl font-semibold text-gray-800">
-                Purchase Order Schedule
-              </h3>
-              <button className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
-                <Download className="mr-2" size={16} />
-                Export CSV
-              </button>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Week
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Demand
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Inventory
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      WOH
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      PO Qty
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      PO Value
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Status
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {poRecommendations.slice(0, 12).map((po, index) => (
-                    <tr key={index} className={po.orderTrigger ? 'bg-yellow-50' : ''}>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        Week {po.week}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {po.demand.toLocaleString()}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {po.inventory.toLocaleString()}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {po.woh?.toFixed(1) || '0.0'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {po.poQuantity > 0 ? po.poQuantity.toLocaleString() : '-'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {po.poValue > 0 ? `${po.poValue.toLocaleString()}` : '-'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        {po.orderTrigger ? (
-                          <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-800">
-                            Order Required
-                          </span>
-                        ) : po.inventory <= po.reorderPoint ? (
-                          <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-800">
-                            Low Stock
-                          </span>
-                        ) : (
-                          <span className="inline-flex px-2 py-1 text-xs font-semibold rounded-full bg-green-100 text-green-800">
-                            Normal
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            {poRecommendations.length > 12 && (
-              <div className="mt-4 text-center text-sm text-gray-500">
-                Showing first 12 weeks. Export CSV for complete data.
-              </div>
-            )}
-          </div>
-        )}
+st.success(f"Loaded {df['ASIN'].nunique()} ASIN(s)")
 
-        {/* Instructions */}
-        {asinData.length === 0 && (
-          <div className="bg-white rounded-lg shadow-lg p-8">
-            <h3 className="text-2xl font-semibold text-gray-800 mb-6">How to Use</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              <div className="text-center">
-                <div className="bg-blue-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                  <Upload className="text-blue-600" size={32} />
-                </div>
-                <h4 className="font-semibold text-gray-800 mb-2">1. Upload Data</h4>
-                <p className="text-sm text-gray-600">
-                  Upload your CSV file with ASIN forecast data including weekly sellout projections.
-                </p>
-              </div>
-              
-              <div className="text-center">
-                <div className="bg-green-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                  <Settings className="text-green-600" size={32} />
-                </div>
-                <h4 className="font-semibold text-gray-800 mb-2">2. Configure Parameters</h4>
-                <p className="text-sm text-gray-600">
-                  Set your inventory levels, pricing, lead times, and target weeks on hand.
-                </p>
-              </div>
-              
-              <div className="text-center">
-                <div className="bg-purple-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                  <TrendingUp className="text-purple-600" size={32} />
-                </div>
-                <h4 className="font-semibold text-gray-800 mb-2">3. Choose Model</h4>
-                <p className="text-sm text-gray-600">
-                  Select from multiple forecasting models and tune parameters for optimal accuracy.
-                </p>
-              </div>
-              
-              <div className="text-center">
-                <div className="bg-orange-100 rounded-full p-4 w-16 h-16 mx-auto mb-4 flex items-center justify-center">
-                  <Package className="text-orange-600" size={32} />
-                </div>
-                <h4 className="font-semibold text-gray-800 mb-2">4. Get Recommendations</h4>
-                <p className="text-sm text-gray-600">
-                  View detailed PO recommendations, timing, quantities, and inventory projections.
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
+asin = st.selectbox("Select ASIN", sorted(df["ASIN"].unique()))
+row = df[df["ASIN"] == asin].iloc[0]
 
-        {/* Features */}
-        <div className="bg-white rounded-lg shadow-lg p-8 mt-8">
-          <h3 className="text-2xl font-semibold text-gray-800 mb-6">Key Features</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            <div className="flex items-start">
-              <TrendingUp className="text-blue-600 mr-3 mt-1 flex-shrink-0" size={20} />
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Multiple Forecast Models</h4>
-                <p className="text-sm text-gray-600">
-                  Choose from Moving Average, Exponential Smoothing, Linear Trend, or Seasonal Naive models.
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-start">
-              <Package className="text-green-600 mr-3 mt-1 flex-shrink-0" size={20} />
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Inventory Optimization</h4>
-                <p className="text-sm text-gray-600">
-                  Automatic calculation of reorder points, safety stock, and target inventory levels.
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-start">
-              <AlertTriangle className="text-orange-600 mr-3 mt-1 flex-shrink-0" size={20} />
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Risk Management</h4>
-                <p className="text-sm text-gray-600">
-                  Identifies stockout risks and provides early warning alerts for inventory management.
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-start">
-              <Settings className="text-purple-600 mr-3 mt-1 flex-shrink-0" size={20} />
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Flexible Parameters</h4>
-                <p className="text-sm text-gray-600">
-                  Customize lead times, order quantities, pricing, and weeks on hand targets.
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-start">
-              <Download className="text-indigo-600 mr-3 mt-1 flex-shrink-0" size={20} />
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Export Capabilities</h4>
-                <p className="text-sm text-gray-600">
-                  Download detailed PO schedules and recommendations for operational planning.
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-start">
-              <div className="w-5 h-5 bg-gradient-to-r from-blue-500 to-purple-600 rounded mr-3 mt-1 flex-shrink-0"></div>
-              <div>
-                <h4 className="font-semibold text-gray-800 mb-1">Interactive Visualizations</h4>
-                <p className="text-sm text-gray-600">
-                  Real-time charts and graphs to visualize demand patterns and inventory flows.
-                </p>
-              </div>
-            </div>
-          </div>
-        </div>
+week_cols = [c for c in df.columns if re.match(r"Week\s*\d+$", c, re.I)]
+history = row[week_cols].astype(float).tolist()
+# Drop leading/trailing zeros? Keep as-is; forecasts can handle zeros.
 
-        {/* Footer */}
-        <div className="text-center mt-12 pb-8">
-          <p className="text-gray-600">
-            Built for Amazon FBA sellers and inventory managers. Deploy easily on Streamlit or any React hosting platform.
-          </p>
-          <div className="mt-4 flex justify-center space-x-4 text-sm text-gray-500">
-            <span>• Real-time forecasting</span>
-            <span>• Inventory optimization</span>
-            <span>• PO automation</span>
-            <span>• Risk management</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
+# -----------------------------
+# Controls
+# -----------------------------
+colA, colB, colC = st.columns(3)
 
-export default AmazonPOPredictor;
+with colA:
+    current_inventory = st.number_input("Current Inventory", min_value=0, value=1000, step=50)
+    asin_price = st.number_input("ASIN Price ($)", min_value=0.0, value=25.99, step=0.5, format="%.2f")
+    target_woh = st.number_input("Target WOH (weeks)", min_value=0.0, value=4.0, step=0.5)
+
+with colB:
+    lead_time_weeks = st.number_input("Lead Time (weeks)", min_value=0, value=3, step=1)
+    safety_stock_weeks = st.number_input("Safety Stock (weeks)", min_value=0.0, value=1.0, step=0.5)
+    forecast_horizon = st.number_input("Forecast Horizon (weeks)", min_value=4, max_value=52, value=26, step=1)
+
+with colC:
+    min_order_qty = st.number_input("Min Order Qty", min_value=0, value=500, step=50)
+    max_order_qty = st.number_input("Max Order Qty", min_value=0, value=10000, step=100)
+    model = st.selectbox("Forecasting Method", ["moving_average", "exponential_smoothing", "linear_trend", "seasonal_naive"])
+
+# Model parameters
+params = {}
+if model == "moving_average":
+    params["ma_periods"] = st.slider("Moving Average Periods", 1, 12, 4)
+elif model == "exponential_smoothing":
+    params["alpha"] = st.slider("Alpha (0.1–0.9)", 0.1, 0.9, 0.3, step=0.1)
+elif model == "seasonal_naive":
+    params["season"] = st.slider("Seasonality Period", 4, 52, 12, step=1)
+
+# -----------------------------
+# Forecast
+# -----------------------------
+if model == "moving_average":
+    forecasts = moving_average(history, forecast_horizon, periods=params["ma_periods"])
+elif model == "exponential_smoothing":
+    forecasts = exponential_smoothing(history, forecast_horizon, alpha=params["alpha"])
+elif model == "linear_trend":
+    forecasts = linear_trend(history, forecast_horizon)
+elif model == "seasonal_naive":
+    forecasts = seasonal_naive(history, forecast_horizon, season=params["season"])
+else:
+    forecasts = [float(np.mean(history)) if history else 0.0]*forecast_horizon
+
+# -----------------------------
+# PO Schedule
+# -----------------------------
+po_df = compute_po_schedule(
+    hist_values=history,
+    forecasts=forecasts,
+    current_inventory=current_inventory,
+    target_woh=target_woh,
+    lead_time_weeks=lead_time_weeks,
+    safety_stock_weeks=safety_stock_weeks,
+    min_order_qty=min_order_qty,
+    max_order_qty=max_order_qty,
+    price=asin_price,
+    avg_window=4,
+)
+
+# KPIs
+total_po_value = int(po_df["POValue"].sum())
+total_po_qty = int(po_df["POQty"].sum())
+avg_woh = float(np.mean(po_df["WOH"])) if len(po_df) else 0.0
+stockout_risk = int((po_df["Inventory"] <= 0).sum())
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total PO Value ($)", f"{total_po_value:,}")
+k2.metric("Total PO Quantity", f"{total_po_qty:,}")
+k3.metric("Avg WOH (weeks)", f"{avg_woh:.1f}")
+k4.metric("Stockout Risk (weeks <=0)", f"{stockout_risk}")
+
+# -----------------------------
+# Charts
+# -----------------------------
+st.subheader("Demand Forecast & Inventory Levels")
+chart_df = po_df[["Week", "Demand", "Inventory", "ReorderPoint"]].melt("Week", var_name="Series", value_name="Value")
+st.line_chart(chart_df, x="Week", y="Value", color="Series", height=320)
+
+st.subheader("Purchase Order Quantities")
+bars = po_df[po_df["POQty"] > 0][["Week", "POQty"]].set_index("Week")
+if not bars.empty:
+    st.bar_chart(bars, height=320)
+else:
+    st.info("No POs triggered with the current parameters.")
+
+# -----------------------------
+# PO Table & Export
+# -----------------------------
+st.subheader("Purchase Order Schedule (first 12 weeks shown)")
+st.dataframe(po_df.head(12), use_container_width=True)
+
+csv_buf = io.StringIO()
+po_df.to_csv(csv_buf, index=False)
+st.download_button(
+    "Export Full PO Schedule (CSV)",
+    data=csv_buf.getvalue(),
+    file_name=f"po_schedule_{asin}.csv",
+    mime="text/csv",
+)
