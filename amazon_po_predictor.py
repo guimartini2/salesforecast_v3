@@ -1,7 +1,3 @@
-
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar } from 'recharts';
-import { Upload, Settings, TrendingUp, Package, AlertTriangle, Download } from 'lucide-react';
-
 const AmazonPOPredictor = () => {
   // State management
   const [csvData, setCsvData] = useState(null);
